@@ -17,6 +17,7 @@
 #include <linux/eventpoll.h>
 #include <linux/rcupdate.h>
 #include <linux/mount.h>
+#include <linux/mnt_namespace.h>
 #include <linux/capability.h>
 #include <linux/cdev.h>
 #include <linux/fsnotify.h>
@@ -328,7 +329,6 @@ static void __fput(struct file *file)
 	struct inode *inode = file->f_inode;
 
 	might_sleep();
-
 	fsnotify_close(file);
 	/*
 	 * The function eventpoll_release() should be the first called
@@ -363,6 +363,13 @@ static void __fput(struct file *file)
 	file->f_inode = NULL;
 	file_free(file);
 	dput(dentry);
+	/*
+	 * A mount handed out by fsmount()/open_tree() lives in a private
+	 * anonymous namespace; it has to be dissolved explicitly instead of
+	 * being released like an ordinary mount.
+	 */
+	if (unlikely(file->f_mode & FMODE_NEED_UNMOUNT))
+		dissolve_on_fput(mnt);
 	mntput(mnt);
 }
 

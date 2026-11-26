@@ -2831,6 +2831,26 @@ int security_fs_use(struct selinux_state *state, struct super_block *sb)
 		c = c->next;
 	}
 
+	/*
+	 * Android's policy carries a fsuse rule for tmpfs but none for ramfs,
+	 * even though ramfs is the same kind of unlabelled, xattr-less memory
+	 * filesystem.  Without a rule ramfs ends up SECURITY_FS_USE_NONE with
+	 * the root inode labelled unlabeled, and writing into it fails with
+	 * EACCES under enforcing.
+	 *
+	 * systemd 249 (and older) mount ramfs unconditionally for its
+	 * credential store and only fall back to tmpfs if that fails, so the
+	 * container's LoadCredential= units break.  Fall back to tmpfs's rule,
+	 * which is what the policy would say if ramfs had been listed: both
+	 * are the "unlabelled memory fs, label the root tmpfs" case.
+	 */
+	if (!c && strcmp(fstype, "ramfs") == 0) {
+		for (c = policydb->ocontexts[OCON_FSUSE]; c; c = c->next) {
+			if (strcmp("tmpfs", c->u.name) == 0)
+				break;
+		}
+	}
+
 	if (c) {
 		sbsec->behavior = c->v.behavior;
 		if (!c->sid[0]) {

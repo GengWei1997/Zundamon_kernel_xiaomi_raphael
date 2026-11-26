@@ -22,6 +22,7 @@
 #include <linux/mount.h>
 #include <linux/pid_namespace.h>
 #include <linux/parser.h>
+#include <linux/fs_parser.h>
 #include <linux/cred.h>
 
 #include "internal.h"
@@ -42,7 +43,7 @@ static int proc_set_super(struct super_block *sb, void *data)
 }
 
 enum {
-	Opt_gid, Opt_hidepid, Opt_err,
+	Opt_gid, Opt_hidepid, Opt_subset, Opt_err,
 };
 
 static const match_table_t tokens = {
@@ -50,6 +51,34 @@ static const match_table_t tokens = {
 	{Opt_gid, "gid=%u"},
 	{Opt_err, NULL},
 };
+
+/*
+ * Symbolic hidepid values, added in 5.8.  systemd passes ProtectProc= as a
+ * name ("off"/"noaccess"/"invisible") rather than a number, so accept both.
+ */
+static const struct constant_table proc_hidepid_table[] = {
+	{ "off",	HIDEPID_OFF },
+	{ "noaccess",	HIDEPID_NO_ACCESS },
+	{ "invisible",	HIDEPID_INVISIBLE },
+	{ }
+};
+
+static int proc_parse_hidepid(const char *value, int *ret)
+{
+	int option;
+
+	if (kstrtoint(value, 10, &option) < 0) {
+		option = lookup_constant(proc_hidepid_table, value, -1);
+		if (option < 0)
+			return -EINVAL;
+	}
+
+	if (option < HIDEPID_OFF || option > HIDEPID_INVISIBLE)
+		return -EINVAL;
+
+	*ret = option;
+	return 0;
+}
 
 static int proc_parse_options(char *options, struct pid_namespace *pid)
 {
@@ -84,6 +113,28 @@ static int proc_parse_options(char *options, struct pid_namespace *pid)
 			pid->hide_pid = option;
 			break;
 		default:
+			/*
+			 * Symbolic hidepid and the subset= option (both added in
+			 * 5.8) do not fit the integer-only match_table above, so
+			 * they are handled here.  subset= is accepted and ignored:
+			 * this tree's proc has no per-mount subset filtering, and
+			 * accepting it is what lets containers mount their own
+			 * /proc the way modern systemd asks for.
+			 */
+			if (!strncmp(p, "hidepid=", 8)) {
+				if (proc_parse_hidepid(p + 8, &option))
+					return 0;
+				pid->hide_pid = option;
+				break;
+			}
+			if (!strncmp(p, "subset=", 7)) {
+				if (strcmp(p + 7, "all") && strcmp(p + 7, "pid")) {
+					pr_err("proc: unrecognized subset value \"%s\"\n",
+					       p + 7);
+					return 0;
+				}
+				break;
+			}
 			pr_err("proc: unrecognized mount option \"%s\" "
 			       "or missing value\n", p);
 			return 0;

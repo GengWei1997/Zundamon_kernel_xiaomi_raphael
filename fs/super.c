@@ -36,8 +36,8 @@
 #include <linux/fsnotify.h>
 #include <linux/lockdep.h>
 #include <linux/user_namespace.h>
+#include <linux/fs_context.h>
 #include "internal.h"
-
 
 static LIST_HEAD(super_blocks);
 static DEFINE_SPINLOCK(sb_lock);
@@ -916,6 +916,90 @@ int do_remount_sb(struct super_block *sb, int flags, void *data, int force)
 	return do_remount_sb2(NULL, sb, flags, data, force);
 }
 
+/**
+ * reconfigure_super - asks filesystem to change superblock parameters
+ * @fc: The superblock and configuration
+ *
+ * Alters the configuration parameters of a live superblock.  This is the
+ * backend of fsconfig(FSCONFIG_CMD_RECONFIGURE); it mirrors the upstream
+ * (5.2+) implementation but keeps using this tree's do_remount_sb2() shape,
+ * which carries the force argument explicitly.
+ *
+ * The caller must hold sb->s_umount for writing.
+ */
+int reconfigure_super(struct fs_context *fc)
+{
+	struct super_block *sb = fc->root->d_sb;
+	int retval;
+	bool remount_ro = false;
+
+	if (fc->sb_flags_mask & ~MS_RMT_MASK)
+		return -EINVAL;
+	if (sb->s_writers.frozen != SB_UNFROZEN)
+		return -EBUSY;
+
+	retval = security_sb_remount(sb, fc->security);
+	if (retval)
+		return retval;
+
+	if (fc->sb_flags_mask & SB_RDONLY) {
+#ifdef CONFIG_BLOCK
+		if (!(fc->sb_flags & SB_RDONLY) && bdev_read_only(sb->s_bdev))
+			return -EACCES;
+#endif
+		remount_ro = (fc->sb_flags & SB_RDONLY) && !sb_rdonly(sb);
+	}
+
+	if (remount_ro) {
+		if (!hlist_empty(&sb->s_pins)) {
+			up_write(&sb->s_umount);
+			group_pin_kill(&sb->s_pins);
+			down_write(&sb->s_umount);
+			if (!sb->s_root)
+				return 0;
+			if (sb->s_writers.frozen != SB_UNFROZEN)
+				return -EBUSY;
+			remount_ro = !sb_rdonly(sb);
+		}
+	}
+	shrink_dcache_sb(sb);
+
+	/* If we are reconfiguring to RDONLY and current sb is read/write,
+	 * make sure there are no files open for writing.
+	 */
+	if (remount_ro) {
+		retval = sb_prepare_remount_readonly(sb);
+		if (retval)
+			return retval;
+	}
+
+	/*
+	 * Ask the filesystem to apply the new options.  For unconverted
+	 * filesystems the legacy backend forwards them to the old remount_fs
+	 * callback; converted ones (none in this tree) would use their own.
+	 */
+	if (fc->ops->reconfigure) {
+		retval = fc->ops->reconfigure(fc);
+		if (retval)
+			goto cancel_readonly;
+	}
+
+	WRITE_ONCE(sb->s_flags, ((sb->s_flags & ~fc->sb_flags_mask) |
+				 (fc->sb_flags & fc->sb_flags_mask)));
+	/* Needs to be ordered wrt mnt_is_readonly() */
+	smp_wmb();
+	sb->s_readonly_remount = 0;
+
+	if (remount_ro && sb->s_bdev)
+		invalidate_bdev(sb->s_bdev);
+	return 0;
+
+cancel_readonly:
+	sb->s_readonly_remount = 0;
+	return retval;
+}
+EXPORT_SYMBOL(reconfigure_super);
+
 static void do_emergency_remount(struct work_struct *work)
 {
 	struct super_block *sb, *p = NULL;
@@ -1207,6 +1291,77 @@ struct dentry *mount_nodev(struct file_system_type *fs_type,
 }
 EXPORT_SYMBOL(mount_nodev);
 
+/**
+ * get_tree_nodev - Get a mountable root with no backing device
+ * @fc: The filesystem context to act upon
+ * @fill_super: The routine to call to set up the superblock
+ *
+ * Create a new unkeyed anonymous superblock, hand it to @fill_super and wrap
+ * the result in a detached mount for @fc.  This is the new-mount-API
+ * equivalent of mount_nodev(), for filesystems that were converted away from
+ * the ->mount() callback.
+ *
+ * Note that ->kill_sb is still the filesystem's own, so use kill_litter_super
+ * (or similar) rather than kill_anon_super unless the superblock is otherwise
+ * destroyed.
+ */
+int get_tree_nodev(struct fs_context *fc,
+		   int (*fill_super)(struct super_block *, struct fs_context *))
+{
+	struct super_block *sb;
+	struct vfsmount *mnt;
+	int err;
+
+	sb = sget(fc->fs_type, NULL, set_anon_super, fc->sb_flags, NULL);
+	if (IS_ERR(sb))
+		return PTR_ERR(sb);
+
+	if (!sb->s_root) {
+		err = fill_super(sb, fc);
+		if (err) {
+			deactivate_locked_super(sb);
+			return err;
+		}
+		sb->s_flags |= SB_ACTIVE;
+
+		/*
+		 * Mirror mount_fs(): SELinux and friends need this before the
+		 * superblock is handed out, and the s_bdi check has always been
+		 * done here too.
+		 */
+		smp_wmb();
+		sb->s_flags |= SB_BORN;
+		WARN_ON(!sb->s_bdi);
+		err = security_sb_kern_mount(sb, fc->sb_flags, NULL);
+		if (err)
+			goto out_fail;
+	}
+
+	mnt = vfs_mount_from_super(fc->fs_type, sb, fc->source ? fc->source :
+							fc->fs_type->name);
+	if (IS_ERR(mnt)) {
+		err = PTR_ERR(mnt);
+		goto out_fail;
+	}
+
+	fc->root = dget(sb->s_root);
+	/*
+	 * put_fs_context() drops fc->root with deactivate_super(), so the
+	 * context needs its own s_active reference; the mount built above
+	 * already holds the one sget() gave us.
+	 */
+	atomic_inc(&sb->s_active);
+	fc->mnt = mnt;
+	up_write(&sb->s_umount);
+	return 0;
+
+out_fail:
+	sb->s_flags &= ~SB_ACTIVE;
+	deactivate_locked_super(sb);
+	return err;
+}
+EXPORT_SYMBOL(get_tree_nodev);
+
 static int compare_single(struct super_block *s, void *p)
 {
 	return 1;
@@ -1256,8 +1411,10 @@ mount_fs(struct file_system_type *type, int flags, const char *name, struct vfsm
 
 	if (type->mount2)
 		root = type->mount2(mnt, type, flags, name, data);
-	else
+	else if (type->mount)
 		root = type->mount(type, flags, name, data);
+	else
+		root = ERR_PTR(-EINVAL);
 	if (IS_ERR(root)) {
 		error = PTR_ERR(root);
 		goto out_free_secdata;

@@ -80,6 +80,8 @@
                                            openat should use the current
                                            working directory. */
 #define AT_SYMLINK_NOFOLLOW	0x100   /* Do not follow symbolic links.  */
+#define AT_EACCESS		0x200	/* Test access permitted for
+                                           effective IDs, not real IDs.  */
 #define AT_REMOVEDIR		0x200   /* Remove directory instead of
                                            unlinking file.  */
 #define AT_SYMLINK_FOLLOW	0x400   /* Follow symbolic links.  */
@@ -90,6 +92,8 @@
 #define AT_STATX_SYNC_AS_STAT	0x0000	/* - Do whatever stat() does */
 #define AT_STATX_FORCE_SYNC	0x2000	/* - Force the attributes to be sync'd with the server */
 #define AT_STATX_DONT_SYNC	0x4000	/* - Don't sync attributes with the server */
+
+#define AT_RECURSIVE		0x8000	/* Apply to the entire subtree */
 
 
 #endif /* _UAPI_LINUX_FCNTL_H */

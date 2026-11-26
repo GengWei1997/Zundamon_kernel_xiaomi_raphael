@@ -27,6 +27,9 @@
 #include <linux/bootmem.h>
 #include <linux/task_work.h>
 #include <linux/sched/task.h>
+#include <linux/fs_context.h>
+#include <linux/fs_parser.h>
+#include <linux/anon_inodes.h>
 
 #include "pnode.h"
 #include "internal.h"
@@ -70,6 +73,11 @@ static struct hlist_head *mount_hashtable __read_mostly;
 static struct hlist_head *mountpoint_hashtable __read_mostly;
 static struct kmem_cache *mnt_cache __read_mostly;
 static DECLARE_RWSEM(namespace_sem);
+
+static bool is_anon_ns(struct mnt_namespace *ns);
+static void free_mnt_ns(struct mnt_namespace *ns);
+static struct mnt_namespace *alloc_mnt_ns(struct user_namespace *user_ns,
+					  bool anon);
 
 /* /sys/fs */
 struct kobject *fs_kobj;
@@ -1029,6 +1037,43 @@ static struct mount *skip_mnt_tree(struct mount *p)
 	}
 	return p;
 }
+
+/*
+ * Wrap an already-built superblock in a detached mount.  Filesystems that use
+ * the new mount API build their own superblock in ->get_tree() instead of
+ * going through mount()/mount_fs(), so they need this rather than
+ * vfs_kern_mount() -- which would call back into type->mount and rebuild it.
+ */
+struct vfsmount *
+vfs_mount_from_super(struct file_system_type *type, struct super_block *sb,
+		     const char *name)
+{
+	struct mount *mnt;
+
+	mnt = alloc_vfsmnt(name);
+	if (!mnt)
+		return ERR_PTR(-ENOMEM);
+
+	if (type->alloc_mnt_data) {
+		mnt->mnt.data = type->alloc_mnt_data();
+		if (!mnt->mnt.data) {
+			mnt_free_id(mnt);
+			free_vfsmnt(mnt);
+			return ERR_PTR(-ENOMEM);
+		}
+	}
+	mnt->mnt.mnt_flags = 0;
+
+	mnt->mnt.mnt_root = dget(sb->s_root);
+	mnt->mnt.mnt_sb = sb;
+	mnt->mnt_mountpoint = mnt->mnt.mnt_root;
+	mnt->mnt_parent = mnt;
+	lock_mount_hash();
+	list_add_tail(&mnt->mnt_instance, &sb->s_mounts);
+	unlock_mount_hash();
+	return &mnt->mnt;
+}
+EXPORT_SYMBOL_GPL(vfs_mount_from_super);
 
 struct vfsmount *
 vfs_kern_mount(struct file_system_type *type, int flags, const char *name, void *data)
@@ -2164,6 +2209,10 @@ static int attach_recursive_mnt(struct mount *source_mnt,
 		attach_mnt(source_mnt, dest_mnt, dest_mp);
 		touch_mnt_namespace(source_mnt->mnt_ns);
 	} else {
+		if (source_mnt->mnt_ns) {
+			/* move from anon - the caller will destroy */
+			list_del_init(&source_mnt->mnt_ns->list);
+		}
 		mnt_set_mountpoint(dest_mnt, dest_mp, source_mnt);
 		commit_tree(source_mnt);
 	}
@@ -2651,6 +2700,1078 @@ static int do_new_mount(struct path *path, const char *fstype, int sb_flags,
 	return err;
 }
 
+/*
+ * ---------------------------------------------------------------------------
+ * New mount API (Linux 5.1/5.2/5.12 backport)
+ *
+ * fsopen()       - open a filesystem for configuration, returns a context fd
+ * fsconfig()     - feed parameters into that context
+ * fsmount()      - turn a configured context into a detached mount fd
+ * fspick()       - open an existing mount for reconfiguration
+ * open_tree()    - get a mount tree (detached clone with OPEN_TREE_CLONE)
+ * move_mount()   - attach a detached mount at a mountpoint
+ * mount_setattr()- change mount attributes in place
+ *
+ * The filesystem context machinery lives in fs/fs_context.c.  Every
+ * filesystem in this tree is unconverted, so fsconfig() parameters are
+ * accumulated as a legacy option string handed to the old mount() callback;
+ * that is the same transition path upstream shipped in 5.2.
+ * ---------------------------------------------------------------------------
+ */
+
+/*
+ * An fs_context file descriptor.  f_op is how fsmount()/fsconfig() recognise
+ * their argument, and ->release drops the context.
+ */
+static int fscontext_release(struct inode *inode, struct file *file)
+{
+	if (file->private_data)
+		put_fs_context(file->private_data);
+	return 0;
+}
+
+static const struct file_operations fscontext_fops = {
+	.release	= fscontext_release,
+	.llseek		= no_llseek,
+};
+
+/* fscontext release is above; mount fds just use the standard O_PATH path. */
+
+/* Wrap a context in a file descriptor. */
+static int fscontext_create_fd(struct fs_context *fc, unsigned int o_flags)
+{
+	struct file *file;
+	int fd;
+
+	file = anon_inode_getfile("[fscontext]", &fscontext_fops, fc, O_RDWR);
+	if (IS_ERR(file))
+		return PTR_ERR(file);
+
+	fd = get_unused_fd_flags(o_flags);
+	if (fd < 0) {
+		fput(file);
+		return fd;
+	}
+	fd_install(fd, file);
+	return fd;
+}
+
+/*
+ * Wrap a detached mount in a file descriptor.
+ *
+ * The mount is first moved into a private anonymous mount namespace so that
+ * it can be reached as an ordinary O_PATH file (f_path.mnt is the mount
+ * itself, which is what move_mount(MOVE_MOUNT_F_EMPTY_PATH) resolves).  The
+ * FMODE_NEED_UNMOUNT marker makes __fput() dissolve that namespace and tear
+ * the whole tree down once the fd is closed without having been adopted by
+ * move_mount().
+ */
+static int mountfd_create_fd(struct vfsmount *mnt, const struct cred *cred,
+			     unsigned int o_flags)
+{
+	struct mnt_namespace *ns;
+	struct path path;
+	struct file *file;
+	struct mount *m, *root;
+	int fd;
+
+	fd = get_unused_fd_flags(o_flags);
+	if (fd < 0)
+		return fd;
+
+	ns = alloc_mnt_ns(current->nsproxy->mnt_ns->user_ns, true);
+	if (IS_ERR(ns)) {
+		put_unused_fd(fd);
+		return PTR_ERR(ns);
+	}
+
+	/*
+	 * Hand the tree over to the anonymous namespace.  The extra reference
+	 * below pins it there and is consumed by dissolve_on_fput(); the
+	 * caller's reference is what @path hands to dentry_open().
+	 */
+	root = real_mount(mnt);
+	lock_mount_hash();
+	for (m = root; m; m = next_mnt(m, root)) {
+		m->mnt_ns = ns;
+		ns->mounts++;
+	}
+	ns->root = root;
+	/*
+	 * Link the namespace into the mount's own list ring so that
+	 * attach_recursive_mnt() can unlink it cleanly when the tree is
+	 * adopted by a real namespace.
+	 */
+	list_add_tail(&ns->list, &root->mnt_list);
+	mntget(mnt);			/* reference held by the namespace */
+	unlock_mount_hash();
+
+	path.mnt = mnt;			/* caller's reference moves to @path */
+	path.dentry = dget(mnt->mnt_root);
+
+	file = dentry_open(&path, O_PATH, cred);
+	path_put(&path);		/* drops the caller's reference */
+	if (IS_ERR(file)) {
+		put_unused_fd(fd);
+		dissolve_on_fput(mnt);	/* consumes the namespace reference */
+		return PTR_ERR(file);
+	}
+
+	file->f_mode |= FMODE_NEED_UNMOUNT;
+	fd_install(fd, file);
+	return fd;
+}
+
+/*
+ * Reset a context so it can be reused for reconfiguration, mirroring
+ * vfs_clean_context() upstream.
+ */
+static void vfs_clean_context(struct fs_context *fc)
+{
+	if (fc->need_free && fc->ops && fc->ops->free)
+		fc->ops->free(fc);
+	fc->need_free = false;
+	fc->fs_private = NULL;
+	fc->sget_key = NULL;
+	fc->sb_flags = 0;
+	kfree(fc->source);
+	fc->source = NULL;
+	fc->purpose = FS_CONTEXT_FOR_RECONFIGURE;
+	fc->phase = FS_CONTEXT_AWAITING_RECONF;
+}
+
+/*
+ * Bring a context back to life after vfs_clean_context() dropped its private
+ * state, so that parameters can be gathered for a reconfigure.  The allocation
+ * is deferred because it happens after the mount or remount has already
+ * succeeded and failing it must not turn a success into an error.
+ */
+static int finish_clean_context(struct fs_context *fc)
+{
+	int ret;
+
+	if (fc->phase != FS_CONTEXT_AWAITING_RECONF)
+		return 0;
+
+	if (fc->fs_type->init_fs_context)
+		ret = fc->fs_type->init_fs_context(fc);
+	else
+		ret = legacy_init_fs_context(fc);
+	if (ret < 0) {
+		fc->phase = FS_CONTEXT_FAILED;
+		return ret;
+	}
+
+	fc->need_free = true;
+	fc->phase = FS_CONTEXT_RECONF_PARAMS;
+	return 0;
+}
+
+/**
+ * sys_fsopen - Open a filesystem for configuration
+ * @_fs_name: The name of the filesystem
+ * @flags: Flags (must be 0)
+ *
+ * Returns a file descriptor referring to a filesystem context.
+ */
+SYSCALL_DEFINE2(fsopen, const char __user *, _fs_name, unsigned int, flags)
+{
+	struct file_system_type *fs_type;
+	struct fs_context *fc;
+	char *fs_name;
+	int ret;
+
+	if (flags & ~FSOPEN_CLOEXEC)
+		return -EINVAL;
+
+	fs_name = strndup_user(_fs_name, 256);
+	if (IS_ERR(fs_name))
+		return PTR_ERR(fs_name);
+
+	fs_type = get_fs_type(fs_name);
+	kfree(fs_name);
+	if (!fs_type)
+		return -ENODEV;
+
+	fc = fs_context_for_mount(fs_type, 0);
+	put_filesystem(fs_type);
+	if (IS_ERR(fc))
+		return PTR_ERR(fc);
+
+	fc->phase = FS_CONTEXT_CREATE_PARAMS;
+
+	ret = fscontext_create_fd(fc, (flags & FSOPEN_CLOEXEC) ? O_CLOEXEC : 0);
+	if (ret < 0)
+		put_fs_context(fc);
+	return ret;
+}
+
+/* fsconfig() commands, matching the upstream UAPI values. */
+#define FSCONFIG_SET_FLAG	0
+#define FSCONFIG_SET_STRING	1
+#define FSCONFIG_SET_BINARY	2
+#define FSCONFIG_SET_PATH	3
+#define FSCONFIG_SET_PATH_EMPTY	4
+#define FSCONFIG_SET_FD		5
+#define FSCONFIG_CMD_CREATE	6
+#define FSCONFIG_CMD_RECONFIGURE 7
+
+/**
+ * sys_fsconfig - Set parameters in a filesystem context
+ * @fd: The filesystem context
+ * @cmd: The command
+ * @_key: The parameter name
+ * @_value: The parameter value
+ * @aux: Extra argument (fd for FSCONFIG_SET_FD)
+ */
+SYSCALL_DEFINE5(fsconfig, int, fd, unsigned int, cmd, const char __user *, _key,
+		const void __user *, _value, int, aux)
+{
+	struct fs_context *fc;
+	struct fd f;
+	struct fs_parameter param = {
+		.type	= fs_param_is_flag,
+	};
+	char *key = NULL;
+	int ret;
+
+	if (fd < 0)
+		return -EINVAL;
+
+	/* Validate the argument shape for each command up front. */
+	switch (cmd) {
+	case FSCONFIG_SET_FLAG:
+		if (!_key || _value || aux)
+			return -EINVAL;
+		break;
+	case FSCONFIG_SET_STRING:
+		if (!_key || !_value || aux)
+			return -EINVAL;
+		break;
+	case FSCONFIG_SET_BINARY:
+		if (!_key || !_value || aux <= 0 || aux > 1024 * 1024)
+			return -EINVAL;
+		break;
+	case FSCONFIG_SET_PATH:
+	case FSCONFIG_SET_PATH_EMPTY:
+		if (!_key || !_value || (aux != AT_FDCWD && aux < 0))
+			return -EINVAL;
+		break;
+	case FSCONFIG_SET_FD:
+		if (!_key || _value || aux < 0)
+			return -EINVAL;
+		break;
+	case FSCONFIG_CMD_CREATE:
+	case FSCONFIG_CMD_RECONFIGURE:
+		if (_key || _value || aux)
+			return -EINVAL;
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+
+	f = fdget(fd);
+	if (!f.file)
+		return -EBADF;
+
+	ret = -EINVAL;
+	if (f.file->f_op != &fscontext_fops)
+		goto out_f;
+
+	fc = f.file->private_data;
+	if (!fc)
+		goto out_f;
+
+	/*
+	 * The legacy backend can only express string and flag options; the
+	 * other parameter types have no representation in the old option
+	 * string, so report that instead of mangling the request.
+	 */
+	if (fc->ops == &legacy_fs_context_ops) {
+		switch (cmd) {
+		case FSCONFIG_SET_BINARY:
+		case FSCONFIG_SET_PATH:
+		case FSCONFIG_SET_PATH_EMPTY:
+		case FSCONFIG_SET_FD:
+			ret = -EOPNOTSUPP;
+			goto out_f;
+		}
+	}
+
+	ret = mutex_lock_interruptible(&fc->uapi_mutex);
+	if (ret)
+		goto out_f;
+
+	/* A context left behind by fsmount() must be revived for reconfigure. */
+	ret = finish_clean_context(fc);
+	if (ret < 0)
+		goto out_unlock;
+
+	switch (cmd) {
+	case FSCONFIG_SET_FLAG:
+		param.key = strndup_user(_key, 256);
+		if (IS_ERR(param.key)) {
+			ret = PTR_ERR(param.key);
+			param.key = NULL;
+			goto out_unlock;
+		}
+		param.type = fs_param_is_flag;
+		ret = vfs_parse_fs_param(fc, &param);
+		kfree(param.key);
+		break;
+	case FSCONFIG_SET_STRING:
+		key = strndup_user(_key, 256);
+		if (IS_ERR(key)) {
+			ret = PTR_ERR(key);
+			key = NULL;
+			goto out_unlock;
+		}
+		param.string = strndup_user(_value, PAGE_SIZE);
+		if (IS_ERR(param.string)) {
+			ret = PTR_ERR(param.string);
+			param.string = NULL;
+			goto out_unlock;
+		}
+		param.key = key;
+		param.type = fs_param_is_string;
+		param.size = strlen(param.string);
+		ret = vfs_parse_fs_param(fc, &param);
+		kfree(param.string);
+		break;
+	case FSCONFIG_CMD_CREATE:
+		if (fc->phase != FS_CONTEXT_CREATE_PARAMS) {
+			ret = -EBUSY;
+			break;
+		}
+		fc->phase = FS_CONTEXT_CREATING;
+		ret = vfs_get_tree(fc);
+		if (ret < 0) {
+			fc->phase = FS_CONTEXT_FAILED;
+			break;
+		}
+		fc->phase = FS_CONTEXT_AWAITING_MOUNT;
+		break;
+	case FSCONFIG_CMD_RECONFIGURE:
+		/*
+		 * Reconfiguring requires a superblock picked by fspick() (or
+		 * left behind by a previous fsmount()), i.e. a context in the
+		 * RECONF_PARAMS phase.
+		 */
+		if (fc->phase != FS_CONTEXT_RECONF_PARAMS) {
+			ret = -EBUSY;
+			break;
+		}
+		fc->phase = FS_CONTEXT_RECONFIGURING;
+		down_write(&fc->root->d_sb->s_umount);
+		ret = reconfigure_super(fc);
+		up_write(&fc->root->d_sb->s_umount);
+		if (ret < 0) {
+			fc->phase = FS_CONTEXT_FAILED;
+			break;
+		}
+		vfs_clean_context(fc);
+		break;
+	default:
+		ret = -EINVAL;
+		break;
+	}
+
+out_unlock:
+	mutex_unlock(&fc->uapi_mutex);
+	kfree(key);
+out_f:
+	fdput(f);
+	return ret;
+}
+
+/**
+ * sys_fsmount - Create a mount from a filesystem context
+ * @fs_fd: The filesystem context
+ * @flags: FSMOUNT_* flags
+ * @attr_flags: MOUNT_ATTR_* flags for the new mount
+ *
+ * Returns a file descriptor for a detached mount, which move_mount() then
+ * attaches somewhere in the namespace.
+ */
+SYSCALL_DEFINE3(fsmount, int, fs_fd, unsigned int, flags,
+		unsigned int, attr_flags)
+{
+	struct fs_context *fc;
+	struct fd f;
+	struct vfsmount *mnt;
+	unsigned int mnt_flags = 0;
+	int mt_flags;
+	int ret;
+
+	if (!may_mount())
+		return -EPERM;
+
+	if (flags & ~FSMOUNT_CLOEXEC)
+		return -EINVAL;
+
+	if (attr_flags & ~(MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID |
+			   MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC |
+			   MOUNT_ATTR__ATIME | MOUNT_ATTR_NODIRATIME |
+			   MOUNT_ATTR_NOSYMFOLLOW))
+		return -EINVAL;
+
+	if (attr_flags & MOUNT_ATTR_RDONLY)
+		mnt_flags |= MNT_READONLY;
+	if (attr_flags & MOUNT_ATTR_NOSUID)
+		mnt_flags |= MNT_NOSUID;
+	if (attr_flags & MOUNT_ATTR_NODEV)
+		mnt_flags |= MNT_NODEV;
+	if (attr_flags & MOUNT_ATTR_NOEXEC)
+		mnt_flags |= MNT_NOEXEC;
+	if (attr_flags & MOUNT_ATTR_NODIRATIME)
+		mnt_flags |= MNT_NODIRATIME;
+	if (attr_flags & MOUNT_ATTR_NOSYMFOLLOW)
+		mnt_flags |= MNT_NOSYMFOLLOW;
+
+	switch (attr_flags & MOUNT_ATTR__ATIME) {
+	case MOUNT_ATTR_STRICTATIME:
+		break;
+	case MOUNT_ATTR_NOATIME:
+		mnt_flags |= MNT_NOATIME;
+		break;
+	case MOUNT_ATTR_RELATIME:
+		mnt_flags |= MNT_RELATIME;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	f = fdget(fs_fd);
+	if (!f.file)
+		return -EBADF;
+
+	ret = -EINVAL;
+	if (f.file->f_op != &fscontext_fops)
+		goto out_f;
+
+	fc = f.file->private_data;
+	if (!fc)
+		goto out_f;
+
+	ret = mutex_lock_interruptible(&fc->uapi_mutex);
+	if (ret)
+		goto out_f;
+
+	/* The superblock must already exist; fsconfig(CMD_CREATE) made it. */
+	ret = -EINVAL;
+	if (fc->phase != FS_CONTEXT_AWAITING_MOUNT)
+		goto out_unlock;
+
+	mnt = fc->mnt;
+	if (!mnt)
+		goto out_unlock;
+
+	mt_flags = mnt_flags;
+	ret = -EPERM;
+	if (mount_too_revealing(mnt, &mt_flags))
+		goto out_unlock;
+
+	/*
+	 * The mount is brand new, so its flags are exactly what was asked for
+	 * plus whatever mount_too_revealing() had to add.
+	 */
+	mnt->mnt_flags = mt_flags;
+
+	/* Ownership of the mount moves to the returned fd. */
+	fc->mnt = NULL;
+
+	ret = mountfd_create_fd(mnt, fc->cred,
+				(flags & FSMOUNT_CLOEXEC) ? O_CLOEXEC : 0);
+	if (ret < 0) {
+		mntput(mnt);
+		goto out_unlock;
+	}
+
+	vfs_clean_context(fc);
+
+out_unlock:
+	mutex_unlock(&fc->uapi_mutex);
+out_f:
+	fdput(f);
+	return ret;
+}
+
+/**
+ * sys_fspick - Pick a mount for reconfiguration
+ * @dfd: Base directory
+ * @path: The path to the mount root
+ * @flags: FSPICK_* flags
+ */
+SYSCALL_DEFINE3(fspick, int, dfd, const char __user *, path, unsigned int, flags)
+{
+	struct fs_context *fc;
+	struct path target;
+	unsigned int lookup_flags;
+	int ret;
+
+	if (!ns_capable(current->nsproxy->mnt_ns->user_ns, CAP_SYS_ADMIN))
+		return -EPERM;
+
+	if (flags & ~(FSPICK_CLOEXEC | FSPICK_SYMLINK_NOFOLLOW |
+		      FSPICK_NO_AUTOMOUNT | FSPICK_EMPTY_PATH))
+		return -EINVAL;
+
+	lookup_flags = LOOKUP_FOLLOW | LOOKUP_AUTOMOUNT;
+	if (flags & FSPICK_SYMLINK_NOFOLLOW)
+		lookup_flags &= ~LOOKUP_FOLLOW;
+	if (flags & FSPICK_NO_AUTOMOUNT)
+		lookup_flags &= ~LOOKUP_AUTOMOUNT;
+	if (flags & FSPICK_EMPTY_PATH)
+		lookup_flags |= LOOKUP_EMPTY;
+
+	ret = user_path_at(dfd, path, lookup_flags, &target);
+	if (ret)
+		return ret;
+
+	ret = -EINVAL;
+	if (target.mnt->mnt_root != target.dentry)
+		goto out_path;
+
+	fc = fs_context_for_reconfigure(target.dentry, 0, 0);
+	if (IS_ERR(fc)) {
+		ret = PTR_ERR(fc);
+		goto out_path;
+	}
+
+	fc->phase = FS_CONTEXT_RECONF_PARAMS;
+
+	path_put(&target);
+
+	ret = fscontext_create_fd(fc, (flags & FSPICK_CLOEXEC) ? O_CLOEXEC : 0);
+	if (ret < 0)
+		put_fs_context(fc);
+	return ret;
+
+out_path:
+	path_put(&target);
+	return ret;
+}
+
+/**
+ * sys_open_tree - Pick a mount tree for further operation
+ * @dfd: Base directory
+ * @path: The mountpoint path
+ * @flags: OPEN_TREE_* / AT_* flags
+ *
+ * Without OPEN_TREE_CLONE the fd pins the mount it refers to.  With it, a
+ * detached copy of the subtree is made and the fd owns it, which is what
+ * move_mount() needs to attach a whole tree elsewhere.
+ */
+SYSCALL_DEFINE3(open_tree, int, dfd, const char __user *, filename,
+		unsigned, flags)
+{
+	struct path path;
+	struct mount *mnt, *tree_mnt;
+	unsigned int lookup_flags = LOOKUP_AUTOMOUNT | LOOKUP_FOLLOW;
+	bool detached = flags & OPEN_TREE_CLONE;
+	int ret;
+
+	if (flags & ~(AT_EMPTY_PATH | AT_NO_AUTOMOUNT | AT_RECURSIVE |
+		      AT_SYMLINK_NOFOLLOW | OPEN_TREE_CLONE |
+		      OPEN_TREE_CLOEXEC))
+		return -EINVAL;
+
+	if ((flags & (AT_RECURSIVE | OPEN_TREE_CLONE)) == AT_RECURSIVE)
+		return -EINVAL;
+
+	if (flags & AT_NO_AUTOMOUNT)
+		lookup_flags &= ~LOOKUP_AUTOMOUNT;
+	if (flags & AT_SYMLINK_NOFOLLOW)
+		lookup_flags &= ~LOOKUP_FOLLOW;
+	if (flags & AT_EMPTY_PATH)
+		lookup_flags |= LOOKUP_EMPTY;
+
+	if (detached && !may_mount())
+		return -EPERM;
+
+	ret = user_path_at(dfd, filename, lookup_flags, &path);
+	if (ret)
+		return ret;
+
+	if (!detached) {
+		/* Just pin the mount the path is on. */
+		struct file *file;
+		int fd;
+
+		fd = get_unused_fd_flags(flags & OPEN_TREE_CLOEXEC);
+		if (fd < 0) {
+			path_put(&path);
+			return fd;
+		}
+
+		file = dentry_open(&path, O_PATH, current_cred());
+		path_put(&path);
+		if (IS_ERR(file)) {
+			put_unused_fd(fd);
+			return PTR_ERR(file);
+		}
+		fd_install(fd, file);
+		return fd;
+	}
+
+	mnt = real_mount(path.mnt);
+
+	ret = -EINVAL;
+	if (IS_MNT_UNBINDABLE(mnt))
+		goto out_path;
+	if (!check_mnt(mnt) && path.dentry->d_op != &ns_dentry_operations)
+		goto out_path;
+	if (!(flags & AT_RECURSIVE) && has_locked_children(mnt, path.dentry))
+		goto out_path;
+
+	namespace_lock();
+	if (flags & AT_RECURSIVE)
+		tree_mnt = copy_tree(mnt, path.dentry, CL_COPY_MNT_NS_FILE);
+	else
+		tree_mnt = clone_mnt(mnt, path.dentry, 0);
+	namespace_unlock();
+
+	if (IS_ERR(tree_mnt)) {
+		ret = PTR_ERR(tree_mnt);
+		goto out_path;
+	}
+
+	/*
+	 * The copy is detached, so move_mount() may adopt it; unlocking it
+	 * lets the receiver change its attributes afterwards.
+	 */
+	tree_mnt->mnt.mnt_flags &= ~MNT_LOCKED;
+
+	ret = mountfd_create_fd(&tree_mnt->mnt, current_cred(),
+				flags & OPEN_TREE_CLOEXEC);
+	if (ret < 0)
+		mntput(&tree_mnt->mnt);
+out_path:
+	path_put(&path);
+	return ret;
+}
+
+/*
+ * Attach a mount tree at @new_path.  This is the workhorse behind both
+ * move_mount() and the old mount(MS_MOVE).
+ */
+static int do_move_mount_to(struct path *old_path, struct path *new_path)
+{
+	struct path parent_path = { .mnt = NULL, .dentry = NULL };
+	struct mnt_namespace *ns;
+	struct mount *p;
+	struct mount *old;
+	struct mountpoint *mp;
+	int err;
+	bool attached;
+
+	mp = lock_mount(new_path);
+	if (IS_ERR(mp))
+		return PTR_ERR(mp);
+
+	old = real_mount(old_path->mnt);
+	p = real_mount(new_path->mnt);
+	attached = mnt_has_parent(old);
+	ns = old->mnt_ns;
+
+	err = -EINVAL;
+	/* The mountpoint must be in our namespace. */
+	if (!check_mnt(p))
+		goto out;
+
+	/* The thing to move must be a mount... */
+	if (!is_mounted(&old->mnt) && !attached)
+		goto out;
+
+	/* ... and either ours or the root of an anonymous namespace. */
+	if (!(attached ? check_mnt(old) : is_anon_ns(ns)))
+		goto out;
+
+	if (old->mnt.mnt_flags & MNT_LOCKED)
+		goto out;
+
+	if (old_path->dentry != old_path->mnt->mnt_root)
+		goto out;
+
+	if (d_is_dir(new_path->dentry) != d_is_dir(old_path->dentry))
+		goto out;
+
+	/* Don't move a mount residing in a shared parent. */
+	if (attached && IS_MNT_SHARED(old->mnt_parent))
+		goto out;
+	/*
+	 * Don't move a mount tree containing unbindable mounts to a
+	 * destination mount which is shared.
+	 */
+	if (IS_MNT_SHARED(p) && tree_contains_unbindable(old))
+		goto out;
+
+	err = -ELOOP;
+	for (; mnt_has_parent(p); p = p->mnt_parent)
+		if (p == old)
+			goto out;
+
+	err = attach_recursive_mnt(old, real_mount(new_path->mnt), mp,
+				   attached ? &parent_path : NULL);
+	if (err)
+		goto out;
+
+	/* A moved mount should no longer expire automatically. */
+	list_del_init(&old->mnt_expire);
+out:
+	unlock_mount(mp);
+	if (!err) {
+		path_put(&parent_path);
+		/*
+		 * The source came from an anonymous namespace, which is now
+		 * empty; the mount lives in our namespace instead.
+		 */
+		if (!attached)
+			free_mnt_ns(ns);
+	}
+	return err;
+}
+
+/* move_mount() flags, matching the upstream UAPI values. */
+#define MOVE_MOUNT_F_SYMLINKS		0x00000001
+#define MOVE_MOUNT_F_AUTOMOUNTS		0x00000002
+#define MOVE_MOUNT_F_EMPTY_PATH		0x00000004
+#define MOVE_MOUNT_T_SYMLINKS		0x00000010
+#define MOVE_MOUNT_T_AUTOMOUNTS		0x00000020
+#define MOVE_MOUNT_T_EMPTY_PATH		0x00000040
+#define MOVE_MOUNT__MASK		0x00000077
+
+/**
+ * sys_move_mount - Move a mount
+ * @from_dfd: Directory for @from_path, or the fd holding it
+ * @from_path: Source mount; empty means "the mount held by @from_dfd"
+ * @to_dfd: Directory for @to_path
+ * @to_path: Destination mountpoint
+ * @flags: MOVE_MOUNT_* flags
+ */
+SYSCALL_DEFINE5(move_mount,
+		int, from_dfd, const char __user *, from_pathname,
+		int, to_dfd, const char __user *, to_pathname,
+		unsigned int, flags)
+{
+	struct path from_path, to_path;
+	unsigned int lflags;
+	int ret = 0;
+
+	if (!may_mount())
+		return -EPERM;
+
+	if (flags & ~MOVE_MOUNT__MASK)
+		return -EINVAL;
+
+	/*
+	 * Symlinks and automounts are only crossed when the matching flag is
+	 * given, mirroring open_tree()/fspick().
+	 */
+	lflags = (flags & MOVE_MOUNT_F_SYMLINKS) ? LOOKUP_FOLLOW : 0;
+	if (flags & MOVE_MOUNT_F_AUTOMOUNTS)
+		lflags |= LOOKUP_AUTOMOUNT;
+	if (flags & MOVE_MOUNT_F_EMPTY_PATH)
+		lflags |= LOOKUP_EMPTY;
+
+	ret = user_path_at(from_dfd, from_pathname, lflags, &from_path);
+	if (ret)
+		return ret;
+
+	lflags = (flags & MOVE_MOUNT_T_SYMLINKS) ? LOOKUP_FOLLOW : 0;
+	if (flags & MOVE_MOUNT_T_AUTOMOUNTS)
+		lflags |= LOOKUP_AUTOMOUNT;
+	if (flags & MOVE_MOUNT_T_EMPTY_PATH)
+		lflags |= LOOKUP_EMPTY;
+
+	ret = user_path_at(to_dfd, to_pathname, lflags, &to_path);
+	if (ret)
+		goto out_from;
+
+	ret = do_move_mount_to(&from_path, &to_path);
+
+	path_put(&to_path);
+out_from:
+	path_put(&from_path);
+	return ret;
+}
+
+/*
+ * mount_setattr(): change the attributes of a mount in place.
+ *
+ * Idmapped mounts (MOUNT_ATTR_IDMAP) and propagation changes are rejected:
+ * this kernel's struct mount has no idmap, and propagation is still handled
+ * by the old mount(MS_SHARED/MS_PRIVATE/...) code path.
+ */
+
+/* Map MOUNT_ATTR_* bits onto the internal MNT_* flags. */
+static unsigned int attr_flags_to_mnt_flags(u64 attr_flags)
+{
+	unsigned int mnt_flags = 0;
+
+	if (attr_flags & MOUNT_ATTR_RDONLY)
+		mnt_flags |= MNT_READONLY;
+	if (attr_flags & MOUNT_ATTR_NOSUID)
+		mnt_flags |= MNT_NOSUID;
+	if (attr_flags & MOUNT_ATTR_NODEV)
+		mnt_flags |= MNT_NODEV;
+	if (attr_flags & MOUNT_ATTR_NOEXEC)
+		mnt_flags |= MNT_NOEXEC;
+	if (attr_flags & MOUNT_ATTR_NODIRATIME)
+		mnt_flags |= MNT_NODIRATIME;
+	if (attr_flags & MOUNT_ATTR_NOSYMFOLLOW)
+		mnt_flags |= MNT_NOSYMFOLLOW;
+
+	return mnt_flags;
+}
+
+/* Refuse to relax attributes that were locked down for us. */
+static bool can_change_locked_flags(struct mount *mnt, unsigned int mnt_flags)
+{
+	unsigned int fl = mnt->mnt.mnt_flags;
+
+	if ((fl & MNT_LOCK_READONLY) && !(mnt_flags & MNT_READONLY))
+		return false;
+	if ((fl & MNT_LOCK_NODEV) && !(mnt_flags & MNT_NODEV))
+		return false;
+	if ((fl & MNT_LOCK_NOSUID) && !(mnt_flags & MNT_NOSUID))
+		return false;
+	if ((fl & MNT_LOCK_NOEXEC) && !(mnt_flags & MNT_NOEXEC))
+		return false;
+	if ((fl & MNT_LOCK_ATIME) &&
+	    ((fl & MNT_ATIME_MASK) != (mnt_flags & MNT_ATIME_MASK)))
+		return false;
+
+	return true;
+}
+
+/* Flip a single mount between read-only and read-write. */
+static int change_mount_ro_state(struct mount *mnt, unsigned int mnt_flags)
+{
+	bool readonly_request = (mnt_flags & MNT_READONLY);
+
+	if (readonly_request == __mnt_is_readonly(&mnt->mnt))
+		return 0;
+
+	if (readonly_request)
+		return mnt_make_readonly(mnt);
+
+	__mnt_unmake_readonly(mnt);
+	return 0;
+}
+
+/*
+ * Update the user-settable attributes on a mount.  The caller must hold
+ * sb->s_umount (for read or write) but must NOT hold the mount hash lock:
+ * this function takes it itself, and so does change_mount_ro_state().
+ */
+static void set_mount_attributes(struct mount *mnt, unsigned int mnt_flags)
+{
+	lock_mount_hash();
+	mnt_flags |= mnt->mnt.mnt_flags & ~MNT_USER_SETTABLE_MASK;
+	mnt->mnt.mnt_flags = mnt_flags;
+	touch_mnt_namespace(mnt->mnt_ns);
+	unlock_mount_hash();
+}
+
+static int __do_mount_setattr(struct mount *mnt, unsigned int attr_set,
+			      unsigned int attr_clr)
+{
+	struct super_block *sb = mnt->mnt.mnt_sb;
+	unsigned int mnt_flags;
+	int ret;
+
+	mnt_flags = mnt->mnt.mnt_flags;
+	mnt_flags &= ~attr_clr;
+	mnt_flags |= attr_set;
+
+	if (!can_change_locked_flags(mnt, mnt_flags))
+		return -EPERM;
+
+	/*
+	 * Changing the read-only state of the mountpoint touches the
+	 * superblock, so take s_umount for write; it is also what the old
+	 * remount path does, so the lock order stays the same.
+	 */
+	down_write(&sb->s_umount);
+	ret = change_mount_ro_state(mnt, mnt_flags);
+	if (!ret)
+		set_mount_attributes(mnt, mnt_flags);
+	up_write(&sb->s_umount);
+
+	return ret;
+}
+
+/**
+ * sys_mount_setattr - Change mount attributes
+ * @dfd: Base directory
+ * @path: The mount path
+ * @flags: AT_RECURSIVE / AT_EMPTY_PATH / AT_SYMLINK_NOFOLLOW
+ * @uattr: struct mount_attr
+ * @usize: Size of the user structure
+ */
+SYSCALL_DEFINE5(mount_setattr, int, dfd, const char __user *, path,
+		unsigned int, flags, struct mount_attr __user *, uattr,
+		size_t, usize)
+{
+	struct mount_attr attr;
+	struct path target;
+	struct mount *mnt, *m, **tree = NULL;
+	unsigned int lookup_flags = LOOKUP_AUTOMOUNT | LOOKUP_FOLLOW;
+	unsigned int attr_set, attr_clr;
+	unsigned int nr = 0, i;
+	int ret;
+
+	BUILD_BUG_ON(sizeof(struct mount_attr) != MOUNT_ATTR_SIZE_VER0);
+
+	if (flags & ~(AT_EMPTY_PATH | AT_RECURSIVE | AT_SYMLINK_NOFOLLOW |
+		      AT_NO_AUTOMOUNT))
+		return -EINVAL;
+
+	if (usize > PAGE_SIZE)
+		return -E2BIG;
+	if (usize < MOUNT_ATTR_SIZE_VER0)
+		return -EINVAL;
+
+	if (!may_mount())
+		return -EPERM;
+
+	if (copy_from_user(&attr, uattr, MOUNT_ATTR_SIZE_VER0))
+		return -EFAULT;
+
+	/* Don't bother walking the mounts if this is a no-op. */
+	if (!attr.attr_set && !attr.attr_clr && !attr.propagation &&
+	    !attr.userns_fd)
+		return 0;
+
+	/*
+	 * Idmapped mounts need s_user_ns plumbing this tree does not have.
+	 * Note that userns_fd is only meaningful together with
+	 * MOUNT_ATTR_IDMAP; systemd passes -EBADF here for ordinary mounts.
+	 */
+	if ((attr.attr_set | attr.attr_clr) & MOUNT_ATTR_IDMAP)
+		return -EOPNOTSUPP;
+
+	/*
+	 * Propagation is a single enum, not a bitmap, and uses the MS_* flag
+	 * values; validate it the same way mount(MS_SHARED) does.
+	 */
+	if (attr.propagation && !flags_to_propagation_type(attr.propagation))
+		return -EINVAL;
+
+	if ((attr.attr_set | attr.attr_clr) &
+	    ~(MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV |
+	      MOUNT_ATTR_NOEXEC | MOUNT_ATTR__ATIME | MOUNT_ATTR_NODIRATIME |
+	      MOUNT_ATTR_NOSYMFOLLOW))
+		return -EINVAL;
+
+	/*
+	 * The atime settings are an enum, not a bitmap: switching requires
+	 * clearing the whole MOUNT_ATTR__ATIME field first.
+	 */
+	if (attr.attr_clr & MOUNT_ATTR__ATIME) {
+		if ((attr.attr_clr & MOUNT_ATTR__ATIME) != MOUNT_ATTR__ATIME)
+			return -EINVAL;
+	} else if (attr.attr_set & MOUNT_ATTR__ATIME) {
+		return -EINVAL;
+	}
+
+	attr_set = attr_flags_to_mnt_flags(attr.attr_set);
+	attr_clr = attr_flags_to_mnt_flags(attr.attr_clr);
+
+	if (attr.attr_clr & MOUNT_ATTR__ATIME) {
+		attr_clr |= MNT_ATIME_MASK;
+		switch (attr.attr_set & MOUNT_ATTR__ATIME) {
+		case MOUNT_ATTR_RELATIME:
+			attr_set |= MNT_RELATIME;
+			break;
+		case MOUNT_ATTR_NOATIME:
+			attr_set |= MNT_NOATIME;
+			break;
+		case MOUNT_ATTR_STRICTATIME:
+			break;
+		default:
+			return -EINVAL;
+		}
+	}
+
+	if (flags & AT_NO_AUTOMOUNT)
+		lookup_flags &= ~LOOKUP_AUTOMOUNT;
+	if (flags & AT_SYMLINK_NOFOLLOW)
+		lookup_flags &= ~LOOKUP_FOLLOW;
+	if (flags & AT_EMPTY_PATH)
+		lookup_flags |= LOOKUP_EMPTY;
+
+	ret = user_path_at(dfd, path, lookup_flags, &target);
+	if (ret)
+		return ret;
+
+	mnt = real_mount(target.mnt);
+	if (target.dentry != mnt->mnt.mnt_root) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	if (!(flags & AT_RECURSIVE)) {
+		if (attr_set || attr_clr) {
+			ret = __do_mount_setattr(mnt, attr_set, attr_clr);
+			if (ret)
+				goto out;
+		}
+		if (attr.propagation) {
+			ret = do_change_type(&target, attr.propagation);
+			if (ret)
+				goto out;
+		}
+		ret = 0;
+		goto out;
+	}
+
+	/*
+	 * Recursive changes have to touch every mount in the subtree.  Collect
+	 * them under namespace_sem with a reference each, then apply the change
+	 * outside it so the s_umount/mount_lock ordering is identical to the
+	 * non-recursive case and no mount can disappear under us.
+	 */
+	namespace_lock();
+	for (m = mnt; m; m = next_mnt(m, mnt))
+		nr++;
+	nr++;	/* include the root itself */
+	tree = kmalloc_array(nr, sizeof(*tree), GFP_KERNEL);
+	if (!tree) {
+		namespace_unlock();
+		ret = -ENOMEM;
+		goto out;
+	}
+	i = 0;
+	for (m = mnt; m && i < nr; m = next_mnt(m, mnt))
+		tree[i++] = m;
+	nr = i;
+	while (i > 0)
+		mntget(&tree[--i]->mnt);
+	namespace_unlock();
+
+	ret = 0;
+	for (i = 0; i < nr; i++) {
+		ret = __do_mount_setattr(tree[i], attr_set, attr_clr);
+		mntput(&tree[i]->mnt);
+		if (ret)
+			break;
+	}
+	kfree(tree);
+
+	/*
+	 * Propagation is applied once to the picked mount; do_change_type()
+	 * walks the subtree itself when MS_REC is set.
+	 */
+	if (!ret && attr.propagation)
+		ret = do_change_type(&target, attr.propagation | MS_REC);
+
+out:
+	path_put(&target);
+	return ret;
+}
+
 int finish_automount(struct vfsmount *m, struct path *path)
 {
 	struct mount *mnt = real_mount(m);
@@ -2929,6 +4050,8 @@ long do_mount(const char *dev_name, const char __user *dir_name,
 		mnt_flags |= MNT_NOATIME;
 	if (flags & MS_NODIRATIME)
 		mnt_flags |= MNT_NODIRATIME;
+	if (flags & MS_NOSYMFOLLOW)
+		mnt_flags |= MNT_NOSYMFOLLOW;
 	if (flags & MS_STRICTATIME)
 		mnt_flags &= ~(MNT_RELATIME | MNT_NOATIME);
 	if (flags & MS_RDONLY)
@@ -2980,10 +4103,39 @@ static void dec_mnt_namespaces(struct ucounts *ucounts)
 
 static void free_mnt_ns(struct mnt_namespace *ns)
 {
-	ns_free_inum(&ns->ns);
+	if (!is_anon_ns(ns))
+		ns_free_inum(&ns->ns);
 	dec_mnt_namespaces(ns->ucounts);
 	put_user_ns(ns->user_ns);
 	kfree(ns);
+}
+
+/*
+ * Dissolve a detached mount tree handed out by fsmount()/open_tree().
+ *
+ * Such a tree lives in a private anonymous mount namespace that nobody can
+ * reach; when the last file referring to it goes away the namespace and
+ * everything below the mount point must be torn down.  This is called from
+ * __fput() before the file's own mntput(), so the reference the tree still
+ * holds for its namespace root is the one being released.
+ */
+void dissolve_on_fput(struct vfsmount *mnt)
+{
+	struct mnt_namespace *ns;
+
+	namespace_lock();
+	lock_mount_hash();
+	ns = real_mount(mnt)->mnt_ns;
+	if (ns) {
+		if (is_anon_ns(ns))
+			umount_tree(real_mount(mnt), UMOUNT_CONNECTED);
+		else
+			ns = NULL;
+	}
+	unlock_mount_hash();
+	namespace_unlock();
+	if (ns)
+		free_mnt_ns(ns);
 }
 
 /*
@@ -2995,7 +4147,18 @@ static void free_mnt_ns(struct mnt_namespace *ns)
  */
 static atomic64_t mnt_ns_seq = ATOMIC64_INIT(1);
 
-static struct mnt_namespace *alloc_mnt_ns(struct user_namespace *user_ns)
+/*
+ * Anonymous namespaces are the private homes of detached mount trees handed
+ * out by fsmount()/open_tree(); they are not exposed through /proc and are
+ * torn down by dissolve_on_fput() when their last reference goes away.
+ */
+static inline bool is_anon_ns(struct mnt_namespace *ns)
+{
+	return ns && ns->seq == 0;
+}
+
+static struct mnt_namespace *alloc_mnt_ns(struct user_namespace *user_ns,
+					  bool anon)
 {
 	struct mnt_namespace *new_ns;
 	struct ucounts *ucounts;
@@ -3005,28 +4168,33 @@ static struct mnt_namespace *alloc_mnt_ns(struct user_namespace *user_ns)
 	if (!ucounts)
 		return ERR_PTR(-ENOSPC);
 
-	new_ns = kmalloc(sizeof(struct mnt_namespace), GFP_KERNEL);
+	new_ns = kzalloc(sizeof(struct mnt_namespace), GFP_KERNEL);
 	if (!new_ns) {
 		dec_mnt_namespaces(ucounts);
 		return ERR_PTR(-ENOMEM);
 	}
-	ret = ns_alloc_inum(&new_ns->ns);
-	if (ret) {
-		kfree(new_ns);
-		dec_mnt_namespaces(ucounts);
-		return ERR_PTR(ret);
+	if (!anon) {
+		ret = ns_alloc_inum(&new_ns->ns);
+		if (ret) {
+			kfree(new_ns);
+			dec_mnt_namespaces(ucounts);
+			return ERR_PTR(ret);
+		}
 	}
 	new_ns->ns.ops = &mntns_operations;
-	new_ns->seq = atomic64_add_return(1, &mnt_ns_seq);
+	/*
+	 * Anonymous namespaces keep seq == 0: that is how is_anon_ns() tells
+	 * them apart from a real namespace, whose seq is always >= 1.  They
+	 * also get no inum, because they are never reachable through nsfs.
+	 */
+	if (!anon)
+		new_ns->seq = atomic64_add_return(1, &mnt_ns_seq);
+
 	atomic_set(&new_ns->count, 1);
-	new_ns->root = NULL;
 	INIT_LIST_HEAD(&new_ns->list);
 	init_waitqueue_head(&new_ns->poll);
-	new_ns->event = 0;
 	new_ns->user_ns = get_user_ns(user_ns);
 	new_ns->ucounts = ucounts;
-	new_ns->mounts = 0;
-	new_ns->pending_mounts = 0;
 	return new_ns;
 }
 
@@ -3050,7 +4218,7 @@ struct mnt_namespace *copy_mnt_ns(unsigned long flags, struct mnt_namespace *ns,
 
 	old = ns->root;
 
-	new_ns = alloc_mnt_ns(user_ns);
+	new_ns = alloc_mnt_ns(user_ns, false);
 	if (IS_ERR(new_ns))
 		return new_ns;
 
@@ -3111,7 +4279,7 @@ struct mnt_namespace *copy_mnt_ns(unsigned long flags, struct mnt_namespace *ns,
  */
 static struct mnt_namespace *create_mnt_ns(struct vfsmount *m)
 {
-	struct mnt_namespace *new_ns = alloc_mnt_ns(&init_user_ns);
+	struct mnt_namespace *new_ns = alloc_mnt_ns(&init_user_ns, false);
 	if (!IS_ERR(new_ns)) {
 		struct mount *mnt = real_mount(m);
 		mnt->mnt_ns = new_ns;

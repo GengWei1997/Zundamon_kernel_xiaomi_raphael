@@ -73,6 +73,8 @@ static struct vfsmount *shm_mnt;
 #include <linux/magic.h>
 #include <linux/syscalls.h>
 #include <linux/fcntl.h>
+#include <linux/fs_context.h>
+#include <linux/fs_parser.h>
 #include <uapi/linux/memfd.h>
 #include <linux/userfaultfd_k.h>
 #include <linux/rmap.h>
@@ -1312,6 +1314,8 @@ static int shmem_writepage(struct page *page, struct writeback_control *wbc)
 	info = SHMEM_I(inode);
 	if (info->flags & VM_LOCKED)
 		goto redirty;
+	if (SHMEM_SB(inode->i_sb)->noswap)
+		goto redirty;
 	if (!total_swap_pages)
 		goto redirty;
 
@@ -2237,6 +2241,8 @@ static struct inode *shmem_get_inode(struct super_block *sb, const struct inode 
 		INIT_LIST_HEAD(&info->swaplist);
 		simple_xattrs_init(&info->xattrs);
 		cache_no_acl(inode);
+		if (sbinfo->noswap)
+			mapping_set_unevictable(inode->i_mapping);
 
 		switch (mode & S_IFMT) {
 		default:
@@ -3507,6 +3513,195 @@ static const struct export_operations shmem_export_ops = {
 	.fh_to_dentry	= shmem_fh_to_dentry,
 };
 
+/*
+ * New mount API support.
+ *
+ * tmpfs is converted to fs_context so that fsconfig() reports it as
+ * converted.  systemd's mount_option_supported() uses fsconfig(SET_FD) as a
+ * probe and treats -EOPNOTSUPP as "filesystem still uses the legacy mount
+ * API"; the legacy backend can only report EOPNOTSUPP for binary/fd
+ * parameters, which made systemd fall back to ramfs for its credentials
+ * tmpfs -- and ramfs has no SELinux fsuse rule on Android, so writing into it
+ * fails with EACCES.
+ */
+enum shmem_param {
+	Opt_gid,
+	Opt_huge,
+	Opt_mode,
+	Opt_mpol,
+	Opt_nr_blocks,
+	Opt_nr_inodes,
+	Opt_size,
+	Opt_uid,
+	Opt_noswap,
+};
+
+static const struct fs_parameter_spec shmem_param_specs[] = {
+	fsparam_u32	("gid",		Opt_gid),
+	fsparam_string	("huge",	Opt_huge),
+	fsparam_u32oct	("mode",	Opt_mode),
+	fsparam_string	("mpol",	Opt_mpol),
+	fsparam_string	("nr_blocks",	Opt_nr_blocks),
+	fsparam_string	("nr_inodes",	Opt_nr_inodes),
+	fsparam_string	("size",	Opt_size),
+	fsparam_u32	("uid",		Opt_uid),
+	fsparam_flag	("noswap",	Opt_noswap),
+	{}
+};
+
+static const struct fs_parameter_description shmem_fs_parameters = {
+	.name	 = "tmpfs",
+	.specs	 = shmem_param_specs,
+};
+
+struct shmem_options {
+	unsigned long long blocks;
+	unsigned long long inodes;
+	struct mempolicy *mpol;
+	kuid_t uid;
+	kgid_t gid;
+	umode_t mode;
+	bool noswap;
+	int huge;
+	int seen;
+#define SHMEM_SEEN_BLOCKS 1
+#define SHMEM_SEEN_INODES 2
+#define SHMEM_SEEN_HUGE 4
+};
+
+/* Set up the in-kernel defaults for a tmpfs superblock. */
+static void shmem_default_options(struct shmem_options *ctx)
+{
+	ctx->mode = S_IRWXUGO | S_ISVTX;
+	ctx->uid = current_fsuid();
+	ctx->gid = current_fsgid();
+}
+
+static int shmem_parse_one(struct fs_context *fc, struct fs_parameter *param)
+{
+	struct shmem_options *ctx = fc->fs_private;
+	struct fs_parse_result result;
+	unsigned long long size;
+	char *rest;
+	int opt;
+
+	if (!ctx)
+		return -EINVAL;
+
+	opt = fs_parse(fc, &shmem_fs_parameters, param, &result);
+	if (opt < 0)
+		return opt;
+
+	switch (opt) {
+	case Opt_size:
+		size = memparse(param->string, &rest);
+		if (*rest == '%') {
+			size <<= PAGE_SHIFT;
+			size *= totalram_pages();
+			do_div(size, 100);
+			rest++;
+		}
+		if (*rest)
+			goto bad_value;
+		ctx->blocks = DIV_ROUND_UP(size, PAGE_SIZE);
+		ctx->seen |= SHMEM_SEEN_BLOCKS;
+		break;
+	case Opt_nr_blocks:
+		ctx->blocks = memparse(param->string, &rest);
+		if (*rest)
+			goto bad_value;
+		ctx->seen |= SHMEM_SEEN_BLOCKS;
+		break;
+	case Opt_nr_inodes:
+		ctx->inodes = memparse(param->string, &rest);
+		if (*rest)
+			goto bad_value;
+		ctx->seen |= SHMEM_SEEN_INODES;
+		break;
+	case Opt_mode:
+		ctx->mode = result.uint_32 & 07777;
+		break;
+	case Opt_uid:
+		ctx->uid = make_kuid(current_user_ns(), result.uint_32);
+		if (!uid_valid(ctx->uid))
+			goto bad_value;
+		break;
+	case Opt_gid:
+		ctx->gid = make_kgid(current_user_ns(), result.uint_32);
+		if (!gid_valid(ctx->gid))
+			goto bad_value;
+		break;
+	case Opt_huge:
+#ifdef CONFIG_TRANSPARENT_HUGE_PAGECACHE
+		ctx->huge = shmem_parse_huge(param->string);
+		if (ctx->huge < 0)
+			goto bad_value;
+		if (!has_transparent_hugepage() &&
+		    ctx->huge != SHMEM_HUGE_NEVER)
+			goto unsupported_parameter;
+		ctx->seen |= SHMEM_SEEN_HUGE;
+		break;
+#else
+		goto unsupported_parameter;
+#endif
+	case Opt_mpol:
+		if (IS_ENABLED(CONFIG_NUMA)) {
+			char *str = kstrdup(param->string, GFP_KERNEL);
+
+			if (!str)
+				return -ENOMEM;
+			mpol_put(ctx->mpol);
+			ctx->mpol = NULL;
+			if (mpol_parse_str(str, &ctx->mpol)) {
+				kfree(str);
+				goto bad_value;
+			}
+			kfree(str);
+			break;
+		}
+		goto unsupported_parameter;
+	case Opt_noswap:
+		/*
+		 * Disable swapping of pages in this mount, as backported from
+		 * 6.3.  systemd probes for this before choosing tmpfs for its
+		 * credentials store.
+		 */
+		ctx->noswap = true;
+		break;
+	}
+	return 0;
+
+unsupported_parameter:
+	pr_err("tmpfs: Unsupported parameter '%s'\n", param->key);
+	return -EINVAL;
+bad_value:
+	pr_err("tmpfs: Bad value for '%s'\n", param->key);
+	return -EINVAL;
+}
+
+/*
+ * Apply the collected options to a freshly allocated shmem_sb_info.  Called
+ * from ->get_tree() via shmem_fill_super().
+ */
+static int shmem_apply_options(struct shmem_options *ctx,
+			       struct shmem_sb_info *sbinfo)
+{
+	if (ctx->seen & SHMEM_SEEN_BLOCKS)
+		sbinfo->max_blocks = ctx->blocks;
+	if (ctx->seen & SHMEM_SEEN_INODES)
+		sbinfo->max_inodes = ctx->inodes;
+	if (ctx->seen & SHMEM_SEEN_HUGE)
+		sbinfo->huge = ctx->huge;
+	sbinfo->mode = ctx->mode;
+	sbinfo->uid = ctx->uid;
+	sbinfo->gid = ctx->gid;
+	sbinfo->noswap = ctx->noswap;
+	mpol_put(sbinfo->mpol);
+	sbinfo->mpol = ctx->mpol;
+	ctx->mpol = NULL;
+	return 0;
+}
+
 static int shmem_parse_options(char *options, struct shmem_sb_info *sbinfo,
 			       bool remount)
 {
@@ -3536,6 +3731,9 @@ static int shmem_parse_options(char *options, struct shmem_sb_info *sbinfo,
 			continue;
 		if ((value = strchr(this_char,'=')) != NULL) {
 			*value++ = 0;
+		} else if (!strcmp(this_char, "noswap")) {
+			/* flag option: no "=value" part */
+			value = NULL;
 		} else {
 			pr_err("tmpfs: No value for mount option '%s'\n",
 			       this_char);
@@ -3563,6 +3761,17 @@ static int shmem_parse_options(char *options, struct shmem_sb_info *sbinfo,
 			sbinfo->max_inodes = memparse(value, &rest);
 			if (*rest)
 				goto bad_val;
+		} else if (!strcmp(this_char, "noswap")) {
+			/*
+			 * Disable swapping of pages in this mount.  Backported
+			 * from 6.3 so that containers can request it (systemd
+			 * uses it for its credentials tmpfs).  On remount the
+			 * option may only stay as it was; switching it in
+			 * either direction is refused, matching upstream.
+			 */
+			if (remount && !sbinfo->noswap)
+				goto bad_val;
+			sbinfo->noswap = true;
 		} else if (!strcmp(this_char,"mode")) {
 			if (remount)
 				continue;
@@ -3620,6 +3829,79 @@ error:
 	mpol_put(mpol);
 	return 1;
 
+}
+
+/*
+ * Reconfigure a tmpfs mount through the new mount API (fspick +
+ * fsconfig(FSCONFIG_CMD_RECONFIGURE)).  The classic ->remount_fs callback
+ * above still serves mount(MS_REMOUNT).
+ */
+static int shmem_reconfigure(struct fs_context *fc)
+{
+	struct shmem_options *ctx = fc->fs_private;
+	struct shmem_sb_info *sbinfo = SHMEM_SB(fc->root->d_sb);
+	unsigned long inodes;
+
+	spin_lock(&sbinfo->stat_lock);
+	inodes = sbinfo->max_inodes - sbinfo->free_inodes;
+
+	if (ctx->seen & SHMEM_SEEN_BLOCKS) {
+		if (percpu_counter_compare(&sbinfo->used_blocks, ctx->blocks) > 0) {
+			spin_unlock(&sbinfo->stat_lock);
+			pr_err("tmpfs: size=%llu too small for existing files\n",
+			       ctx->blocks);
+			return -EBUSY;
+		}
+		if (ctx->blocks && !sbinfo->max_blocks) {
+			spin_unlock(&sbinfo->stat_lock);
+			pr_err("tmpfs: modifying mounting information is not allowed\n");
+			return -EINVAL;
+		}
+	}
+
+	if (ctx->seen & SHMEM_SEEN_INODES) {
+		if (ctx->inodes < inodes) {
+			spin_unlock(&sbinfo->stat_lock);
+			pr_err("tmpfs: nr_inodes=%llu too small for existing files\n",
+			       ctx->inodes);
+			return -EBUSY;
+		}
+		if (ctx->inodes && !sbinfo->max_inodes) {
+			spin_unlock(&sbinfo->stat_lock);
+			pr_err("tmpfs: modifying mounting information is not allowed\n");
+			return -EINVAL;
+		}
+	}
+
+	if (ctx->seen & SHMEM_SEEN_BLOCKS) {
+		sbinfo->max_blocks = ctx->blocks;
+		sbinfo->free_inodes = sbinfo->max_inodes - inodes;
+	}
+	if (ctx->seen & SHMEM_SEEN_INODES) {
+		sbinfo->max_inodes = ctx->inodes;
+		sbinfo->free_inodes = sbinfo->max_inodes - inodes;
+	}
+	if (ctx->seen & SHMEM_SEEN_HUGE)
+		sbinfo->huge = ctx->huge;
+
+	/*
+	 * Preserve the previous mempolicy unless an mpol was specified.  noswap
+	 * may only be turned on, and only if it was on before: switching it
+	 * either way on a live mount is refused, matching the flag's intent.
+	 */
+	if (ctx->mpol) {
+		mpol_put(sbinfo->mpol);
+		sbinfo->mpol = ctx->mpol;
+		ctx->mpol = NULL;
+	}
+	if (ctx->noswap && !sbinfo->noswap) {
+		spin_unlock(&sbinfo->stat_lock);
+		pr_err("tmpfs: noswap cannot be enabled on remount\n");
+		return -EINVAL;
+	}
+
+	spin_unlock(&sbinfo->stat_lock);
+	return 0;
 }
 
 static int shmem_remount_fs(struct super_block *sb, int *flags, char *data)
@@ -3825,7 +4107,7 @@ int shmem_fill_super(struct super_block *sb, void *data, int silent)
 	if (!(sb->s_flags & MS_KERNMOUNT)) {
 		sbinfo->max_blocks = shmem_default_max_blocks();
 		sbinfo->max_inodes = shmem_default_max_inodes();
-		if (shmem_parse_options(data, sbinfo, false)) {
+		if (data && shmem_parse_options(data, sbinfo, false)) {
 			err = -EINVAL;
 			goto failed;
 		}
@@ -4019,6 +4301,66 @@ static const struct vm_operations_struct shmem_vm_ops = {
 #endif
 };
 
+/*
+ * fill_super callback used by the new mount API path.  The options have
+ * already been parsed into @fc->fs_private by ->parse_param().
+ */
+static int shmem_fill_super_fc(struct super_block *sb, struct fs_context *fc)
+{
+	struct shmem_options *ctx = fc->fs_private;
+	struct shmem_sb_info *sbinfo;
+	int err;
+
+	err = shmem_fill_super(sb, NULL, fc->sb_flags & SB_SILENT ? 1 : 0);
+	if (err)
+		return err;
+
+	sbinfo = SHMEM_SB(sb);
+	if (ctx)
+		shmem_apply_options(ctx, sbinfo);
+
+	return 0;
+}
+
+static int shmem_get_tree(struct fs_context *fc)
+{
+	return get_tree_nodev(fc, shmem_fill_super_fc);
+}
+
+static void shmem_free_fc(struct fs_context *fc)
+{
+	struct shmem_options *ctx = fc->fs_private;
+
+	if (ctx) {
+		mpol_put(ctx->mpol);
+		kfree(ctx);
+		fc->fs_private = NULL;
+	}
+}
+
+static const struct fs_context_operations shmem_fs_context_ops = {
+	.free		= shmem_free_fc,
+	.get_tree	= shmem_get_tree,
+#ifdef CONFIG_TMPFS
+	.parse_param	= shmem_parse_one,
+	.reconfigure	= shmem_reconfigure,
+#endif
+};
+
+static int shmem_init_fs_context(struct fs_context *fc)
+{
+	struct shmem_options *ctx;
+
+	ctx = kzalloc(sizeof(struct shmem_options), GFP_KERNEL);
+	if (!ctx)
+		return -ENOMEM;
+
+	shmem_default_options(ctx);
+	fc->fs_private = ctx;
+	fc->ops = &shmem_fs_context_ops;
+	return 0;
+}
+
 static struct dentry *shmem_mount(struct file_system_type *fs_type,
 	int flags, const char *dev_name, void *data)
 {
@@ -4028,7 +4370,17 @@ static struct dentry *shmem_mount(struct file_system_type *fs_type,
 static struct file_system_type shmem_fs_type = {
 	.owner		= THIS_MODULE,
 	.name		= "tmpfs",
+	/*
+	 * Keep the classic ->mount() entry point for kern_mount() and the
+	 * legacy mount(2) path, and additionally provide ->init_fs_context so
+	 * that fsopen()/fsconfig() reach shmem_fs_context_ops.  noswap and the
+	 * SET_FD probe only work through the latter.
+	 */
 	.mount		= shmem_mount,
+	.init_fs_context = shmem_init_fs_context,
+#ifdef CONFIG_TMPFS
+	.parameters	= &shmem_fs_parameters,
+#endif
 	.kill_sb	= kill_litter_super,
 	.fs_flags	= FS_USERNS_MOUNT,
 };

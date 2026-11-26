@@ -1687,6 +1687,26 @@ static long kernel_waitid(int which, pid_t upid, struct waitid_info *infop,
 		if (upid <= 0)
 			return -EINVAL;
 		break;
+	case P_PIDFD:
+		type = PIDTYPE_PID;
+		if (upid < 0)
+			return -EINVAL;
+
+		{
+			/*
+			 * This kernel's pidfd_get_pid() writes the file flags
+			 * back through the pointer unconditionally, so it must
+			 * not be NULL.
+			 */
+			unsigned int pidfd_flags = 0;
+
+			pid = pidfd_get_pid(upid, &pidfd_flags);
+			if (IS_ERR(pid))
+				return PTR_ERR(pid);
+		}
+
+		/* pid is already referenced, don't look it up again below */
+		goto have_pid;
 	default:
 		return -EINVAL;
 	}
@@ -1694,6 +1714,7 @@ static long kernel_waitid(int which, pid_t upid, struct waitid_info *infop,
 	if (type < PIDTYPE_MAX)
 		pid = find_get_pid(upid);
 
+have_pid:
 	wo.wo_type	= type;
 	wo.wo_pid	= pid;
 	wo.wo_flags	= options;

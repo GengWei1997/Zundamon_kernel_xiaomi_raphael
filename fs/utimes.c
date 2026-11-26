@@ -119,46 +119,50 @@ out:
 long do_utimes(int dfd, const char __user *filename, struct timespec64 *times,
 	       int flags)
 {
-	int error = -EINVAL;
+	struct fd f;
+	struct path path;
+	int lookup_flags = 0, error;
 
 	if (times && (!nsec_valid(times[0].tv_nsec) ||
-		      !nsec_valid(times[1].tv_nsec))) {
-		goto out;
-	}
-
-	if (flags & ~AT_SYMLINK_NOFOLLOW)
-		goto out;
+		      !nsec_valid(times[1].tv_nsec)))
+		return -EINVAL;
 
 	if (filename == NULL && dfd != AT_FDCWD) {
-		struct fd f;
-
-		if (flags & AT_SYMLINK_NOFOLLOW)
-			goto out;
+		if (flags)
+			return -EINVAL;
 
 		f = fdget(dfd);
-		error = -EBADF;
 		if (!f.file)
-			goto out;
-
+			return -EBADF;
 		error = utimes_common(&f.file->f_path, times);
 		fdput(f);
-	} else {
-		struct path path;
-		int lookup_flags = 0;
+		return error;
+	}
 
-		if (!(flags & AT_SYMLINK_NOFOLLOW))
-			lookup_flags |= LOOKUP_FOLLOW;
+	/*
+	 * AT_EMPTY_PATH was added in 5.8 and is what systemd's
+	 * futimens_opath() uses: it opens the node with O_PATH and then
+	 * updates it through the fd with an empty path.  Without it udev
+	 * cannot touch /run/udev/queue and stops processing netdev uevents.
+	 */
+	if (flags & ~(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH))
+		return -EINVAL;
+
+	if (!(flags & AT_SYMLINK_NOFOLLOW))
+		lookup_flags |= LOOKUP_FOLLOW;
+	if (flags & AT_EMPTY_PATH)
+		lookup_flags |= LOOKUP_EMPTY;
+
 retry:
-		error = user_path_at(dfd, filename, lookup_flags, &path);
-		if (error)
-			goto out;
+	error = user_path_at(dfd, filename, lookup_flags, &path);
+	if (error)
+		goto out;
 
-		error = utimes_common(&path, times);
-		path_put(&path);
-		if (retry_estale(error, lookup_flags)) {
-			lookup_flags |= LOOKUP_REVAL;
-			goto retry;
-		}
+	error = utimes_common(&path, times);
+	path_put(&path);
+	if (retry_estale(error, lookup_flags)) {
+		lookup_flags |= LOOKUP_REVAL;
+		goto retry;
 	}
 
 out:

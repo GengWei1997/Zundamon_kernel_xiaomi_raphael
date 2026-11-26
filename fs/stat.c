@@ -21,6 +21,9 @@
 #include <linux/uaccess.h>
 #include <asm/unistd.h>
 
+/* Needed for real_mount().  fs/mount.h has an include guard. */
+#include "mount.h"
+
 /**
  * generic_fillattr - Fill in the basic attributes from the inode struct
  * @inode: Inode to use as the source
@@ -142,6 +145,17 @@ int vfs_statx_fd(unsigned int fd, struct kstat *stat,
 	if (f.file) {
 		error = vfs_getattr(&f.file->f_path, stat,
 				    request_mask, query_flags);
+		if (!error) {
+			struct path *p = &f.file->f_path;
+
+			stat->mnt_id = real_mount(p->mnt)->mnt_id;
+			stat->result_mask |= STATX_MNT_ID;
+			if (request_mask & STATX_MNT_ID_UNIQUE)
+				stat->result_mask |= STATX_MNT_ID_UNIQUE;
+			if (p->mnt->mnt_root == p->dentry)
+				stat->attributes |= STATX_ATTR_MOUNT_ROOT;
+			stat->attributes_mask |= STATX_ATTR_MOUNT_ROOT;
+		}
 		fdput(f);
 	}
 	return error;
@@ -187,6 +201,15 @@ retry:
 		goto out;
 
 	error = vfs_getattr(&path, stat, request_mask, flags);
+	if (!error) {
+		stat->mnt_id = real_mount(path.mnt)->mnt_id;
+		stat->result_mask |= STATX_MNT_ID;
+		if (request_mask & STATX_MNT_ID_UNIQUE)
+			stat->result_mask |= STATX_MNT_ID_UNIQUE;
+		if (path.mnt->mnt_root == path.dentry)
+			stat->attributes |= STATX_ATTR_MOUNT_ROOT;
+		stat->attributes_mask |= STATX_ATTR_MOUNT_ROOT;
+	}
 	path_put(&path);
 	if (retry_estale(error, lookup_flags)) {
 		lookup_flags |= LOOKUP_REVAL;
@@ -541,6 +564,7 @@ cp_statx(const struct kstat *stat, struct statx __user *buffer)
 	tmp.stx_rdev_minor = MINOR(stat->rdev);
 	tmp.stx_dev_major = MAJOR(stat->dev);
 	tmp.stx_dev_minor = MINOR(stat->dev);
+	tmp.stx_mnt_id = stat->mnt_id;
 
 	return copy_to_user(buffer, &tmp, sizeof(tmp)) ? -EFAULT : 0;
 }

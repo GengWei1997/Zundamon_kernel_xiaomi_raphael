@@ -461,6 +461,99 @@ SYSCALL_DEFINE2(access, const char __user *, filename, int, mode)
 	return sys_faccessat(AT_FDCWD, filename, mode);
 }
 
+/*
+ * faccessat2() is the same as faccessat() but additionally accepts a flags
+ * argument.  The flags understood here are AT_EACCESS, AT_SYMLINK_NOFOLLOW
+ * and AT_EMPTY_PATH (upstream Linux 5.8).
+ *
+ * Userspace that checks access on an already opened file descriptor, such as
+ * systemd's access_fd(), needs this.
+ */
+SYSCALL_DEFINE4(faccessat2, int, dfd, const char __user *, filename, int, mode,
+		int, flags)
+{
+	const struct cred *old_cred = NULL;
+	struct cred *override_cred = NULL;
+	struct path path;
+	struct inode *inode;
+	struct vfsmount *mnt;
+	int res;
+	unsigned int lookup_flags = LOOKUP_FOLLOW;
+
+	if (mode & ~S_IRWXO)	/* where's F_OK, X_OK, W_OK, R_OK? */
+		return -EINVAL;
+
+	if (flags & ~(AT_EACCESS | AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH))
+		return -EINVAL;
+
+	if (flags & AT_SYMLINK_NOFOLLOW)
+		lookup_flags &= ~LOOKUP_FOLLOW;
+	if (flags & AT_EMPTY_PATH)
+		lookup_flags |= LOOKUP_EMPTY;
+
+	/* AT_EACCESS: test with the effective IDs, so do not switch creds. */
+	if (!(flags & AT_EACCESS)) {
+		override_cred = prepare_creds();
+		if (!override_cred)
+			return -ENOMEM;
+
+		override_cred->fsuid = override_cred->uid;
+		override_cred->fsgid = override_cred->gid;
+
+		if (!issecure(SECURE_NO_SETUID_FIXUP)) {
+			/* Clear the capabilities if we switch to a non-root user */
+			kuid_t root_uid = make_kuid(override_cred->user_ns, 0);
+			if (!uid_eq(override_cred->uid, root_uid))
+				cap_clear(override_cred->cap_effective);
+			else
+				override_cred->cap_effective =
+					override_cred->cap_permitted;
+		}
+
+		override_cred->non_rcu = 1;
+
+		old_cred = override_creds(override_cred);
+	}
+retry:
+	res = user_path_at(dfd, filename, lookup_flags, &path);
+	if (res)
+		goto out;
+
+	inode = d_backing_inode(path.dentry);
+	mnt = path.mnt;
+
+	if ((mode & MAY_EXEC) && S_ISREG(inode->i_mode)) {
+		/*
+		 * MAY_EXEC on regular files is denied if the fs is mounted
+		 * with the "noexec" flag.
+		 */
+		res = -EACCES;
+		if (path_noexec(&path))
+			goto out_path_release;
+	}
+
+	res = inode_permission2(mnt, inode, mode | MAY_ACCESS);
+	/* SuS v2 requires we report a read only fs too */
+	if (res || !(mode & S_IWOTH) || special_file(inode->i_mode))
+		goto out_path_release;
+
+	if (__mnt_is_readonly(path.mnt))
+		res = -EROFS;
+
+out_path_release:
+	path_put(&path);
+	if (retry_estale(res, lookup_flags)) {
+		lookup_flags |= LOOKUP_REVAL;
+		goto retry;
+	}
+out:
+	if (old_cred)
+		revert_creds(old_cred);
+	if (override_cred)
+		put_cred(override_cred);
+	return res;
+}
+
 SYSCALL_DEFINE1(chdir, const char __user *, filename)
 {
 	struct path path;

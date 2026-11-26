@@ -4400,6 +4400,16 @@ err_unlock:
 	return -EOPNOTSUPP;
 }
 
+/*
+ * This kernel has no nexthop object support (that arrived in Linux 5.3).
+ * Userspace such as systemd-networkd nevertheless enumerates nexthops with
+ * RTM_GETNEXTHOP; report an empty table instead of failing the request.
+ */
+static int rtnl_dump_nexthop(struct sk_buff *skb, struct netlink_callback *cb)
+{
+	return 0;
+}
+
 static void rtnetlink_rcv(struct sk_buff *skb)
 {
 	netlink_rcv_skb(skb, &rtnetlink_rcv_msg);
@@ -4509,4 +4519,6 @@ void __init rtnetlink_init(void)
 
 	rtnl_register(PF_UNSPEC, RTM_GETSTATS, rtnl_stats_get, rtnl_stats_dump,
 		      0);
+
+	rtnl_register(PF_UNSPEC, RTM_GETNEXTHOP, NULL, rtnl_dump_nexthop, 0);
 }
